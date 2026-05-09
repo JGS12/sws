@@ -9,9 +9,14 @@ pub fn parseFrame(data: []u8) !Frame {
     const second_byte = data[1];
 
     const fin = (first_byte & 0x80) != 0;
+    const rsv = first_byte & 0x70;
     const opcode = Opcode.fromByte(first_byte) orelse return error.UnknownOpcode;
     const mask = (second_byte & 0x80) != 0;
     var payload_len: u64 = @intCast(second_byte & 0x7F);
+
+    // 修改原因：服务端解析客户端帧时必须拒绝未协商扩展的 RSV 位和未 masked 的帧，
+    // 否则会接受违反 RFC 6455 的输入并把协议错误交给后续业务路径处理。
+    if (rsv != 0 or !mask) return error.InvalidFrame;
 
     var offset: usize = 2;
 
@@ -24,6 +29,13 @@ pub fn parseFrame(data: []u8) !Frame {
         payload_len = std.mem.readInt(u64, data[2..10], .big);
         if (payload_len & 0x8000_0000_0000_0000 != 0) return error.InvalidFrame;
         offset = 10;
+    }
+
+    // 修改原因：控制帧按协议不能分片，payload 也不能超过 125 字节；
+    // 提前拒绝可避免 ping/close 响应路径为非法长度分配或写帧失败。
+    switch (opcode) {
+        .close, .ping, .pong => if (!fin or payload_len > 125) return error.InvalidFrame,
+        else => {},
     }
 
     var mask_key: [4]u8 = undefined;
@@ -41,6 +53,31 @@ pub fn parseFrame(data: []u8) !Frame {
     }
 
     return Frame{ .opcode = opcode, .fin = fin, .payload = payload };
+}
+
+test "parseFrame rejects invalid client control frames" {
+    var unmasked = [_]u8{ 0x89, 0x00 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&unmasked));
+
+    var fragmented_ping = [_]u8{ 0x09, 0x80, 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&fragmented_ping));
+
+    var oversized_ping = [_]u8{ 0x89, 0xFE, 0, 126, 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidFrame, parseFrame(&oversized_ping));
+}
+
+test "control frames allow the RFC maximum payload" {
+    var ping = [_]u8{0} ** (2 + 4 + 125);
+    ping[0] = 0x89;
+    ping[1] = 0x80 | 125;
+
+    const parsed = try parseFrame(ping[0..]);
+    try std.testing.expectEqual(Opcode.ping, parsed.opcode);
+    try std.testing.expectEqual(@as(usize, 125), parsed.payload.len);
+
+    var out: [127]u8 = undefined;
+    const written = try writeFrame(&out, .{ .opcode = .pong, .fin = true, .payload = parsed.payload });
+    try std.testing.expectEqual(@as(usize, out.len), written);
 }
 
 pub fn frameSize(payload_len: usize) usize {
@@ -103,11 +140,19 @@ fn maskPayload(payload: []u8, mask_key: [4]u8) void {
             chunk.* ^= mask_vec;
             i += 16;
         }
-    } else {
-        // Unaligned slow path: byte-by-byte for safety
-        const end = chunk_count * 16;
-        while (i < end) : (i += 1) {
-            payload[i] ^= mask_key[i & 3];
+    } else if (chunk_count > 0) {
+        // Unaligned payload: fall back to 4-byte-at-a-time XOR using
+        // readInt/writeInt which handle unaligned access safely.
+        // Avoids the byte-by-byte slow path for moderate-sized frames.
+        const mask_u32 = (@as(u32, mask_key[0])) |
+            (@as(u32, mask_key[1]) << 8) |
+            (@as(u32, mask_key[2]) << 16) |
+            (@as(u32, mask_key[3]) << 24);
+        const bulk_end = chunk_count * 16;
+        i = 0;
+        while (i + 4 <= bulk_end) : (i += 4) {
+            const val = std.mem.readInt(u32, payload[i..][0..4], .little);
+            std.mem.writeInt(u32, payload[i..][0..4], val ^ mask_u32, .little);
         }
     }
     // Tail: remaining < 16 bytes

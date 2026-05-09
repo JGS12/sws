@@ -65,7 +65,12 @@ pub fn run(self: *AsyncServer) !void {
     var cqes: [MAX_CQES_BATCH]linux.io_uring_cqe = undefined;
     var user_tasks_buf: [USER_TASK_BATCH]Item = undefined;
     while (!@atomicLoad(bool, &self.should_stop, .acquire)) {
-        try self.buffer_pool.flushReplenish(&self.ring);
+        // flushReplenish may fail when the SQ ring is full (scale > buffer
+        // churn rate). This is non-fatal: remaining bids stay in the queue
+        // and are retried next iteration. Do NOT propagate the error.
+        self.buffer_pool.flushReplenish(&self.ring) catch |err| {
+            logErr("flushReplenish deferred: {s}", .{@errorName(err)});
+        };
 
         if (self.accept_stalled) {
             self.submitAccept() catch |err| {
@@ -80,7 +85,13 @@ pub fn run(self: *AsyncServer) !void {
             logErr("submit failed: {s}", .{@errorName(err)});
         };
 
-        const n = try self.ring.copy_cqes(&cqes, 0);
+        const n = self.ring.copy_cqes(&cqes, 0) catch |err| {
+            if (err == error.SignalInterrupt) {
+                // SIGTERM arrived during copy_cqes — loop back to check should_stop.
+                continue;
+            }
+            return err;
+        };
         if (n > 0) {
             dispatchCqes(self, &cqes, n);
             drainPendingResumes(self);
@@ -116,8 +127,18 @@ pub fn run(self: *AsyncServer) !void {
         if (self.fiber_shared) |fs| fs.tick();
         ttlScanTick(self);
 
-        _ = try self.ring.submit_and_wait(1);
-        const n2 = try self.ring.copy_cqes(&cqes, 0);
+        _ = self.ring.submit_and_wait(1) catch |err| {
+            if (err == error.SignalInterrupt) {
+                continue;
+            }
+            return err;
+        };
+        const n2 = self.ring.copy_cqes(&cqes, 0) catch |err| {
+            if (err == error.SignalInterrupt) {
+                continue;
+            }
+            return err;
+        };
         dispatchCqes(self, &cqes, n2);
         drainPendingResumes(self);
         if (self.fiber_shared) |fs| fs.tick();
@@ -175,13 +196,17 @@ pub fn dispatchCqes(self: *AsyncServer, cqes: []linux.io_uring_cqe, n: usize) vo
                     const bid = @as(u16, @truncate(cqe.flags >> 16));
                     self.buffer_pool.markReplenish(bid);
                 }
-                // write just completed — clear flag so closeConn can
-                // enter its normal buffer-freeing path (see closeConn
-                // writev_in_flight guard).
                 if (conn_ptr.pool_idx != 0xFFFFFFFF) {
                     self.pool.slots[conn_ptr.pool_idx].line4.writev_in_flight = 0;
                 }
                 self.closeConn(conn_id, conn_ptr.fd);
+            } else if (conn_ptr.state == .waiting_computation) {
+                // Worker pool still computing; no new I/O is submitted in this state.
+                // A residual CQE (e.g. a late read completion) must only replenish
+                // its buffer — do NOT close the connection.
+                if (cqe.flags & linux.IORING_CQE_F_BUFFER != 0) {
+                    self.buffer_pool.markReplenish(sticker.extractBid(cqe.flags));
+                }
             } else {
                 self.closeConn(conn_id, conn_ptr.fd);
             }

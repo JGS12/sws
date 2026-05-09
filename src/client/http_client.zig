@@ -13,7 +13,9 @@ pub const Response = struct {
     allocator: Allocator,
 
     pub fn deinit(self: *Response) void {
-        self.allocator.free(self.body);
+        // Guard: a zero-length body may be a compile-time constant from the
+        // makeErrorResponse triple-fallback path. Only free heap-allocated bodies.
+        if (self.body.len > 0) self.allocator.free(self.body);
     }
 };
 
@@ -98,6 +100,8 @@ fn responseCompleteLen(data: []const u8) !?usize {
 }
 
 fn makeErrorResponse(allocator: Allocator, status: u16, msg: []const u8) Response {
+    // Triple-fallback: dupe -> alloc(0) -> zero-length compile-time literal.
+    // The final literal is safe because Response.deinit guards on body.len > 0.
     const body = allocator.dupe(u8, msg) catch allocator.alloc(u8, 0) catch &.{};
     return .{ .status = status, .body = body, .allocator = allocator };
 }
@@ -189,8 +193,6 @@ pub const HttpClient = struct {
             .body = null,
             .response = undefined,
             .done = false,
-            .mutex = .init,
-            .cond = .init,
             .allocator = self.allocator,
             .client = self,
             .pool_id = idx,
@@ -256,22 +258,18 @@ pub const HttpClient = struct {
 
         try self.ring_b.invoke.push(self.allocator, *RequestContext, ctx, handleRequest);
         {
+            // Spin-wait on the atomic done flag, set by notify() on the IO thread.
+            // Single-writer (IO thread) single-reader (caller thread): atomics suffice.
             const deadline_ms = nowMs() + REQUEST_TIMEOUT_MS;
-            while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
-            while (!ctx.done) {
-                ctx.mutex.state.store(.unlocked, .release);
+            while (!@atomicLoad(bool, &ctx.done, .acquire)) {
                 std.Thread.yield() catch {};
                 if (nowMs() >= deadline_ms or @atomicLoad(bool, &self.stop, .acquire)) {
-                    // cancel → release 槽位: gen 自增, 旧 fiber notify 失效
                     @atomicStore(bool, &ctx.cancelled, true, .release);
                     @atomicStore(bool, &ctx.done, true, .release);
-                    ctx.mutex.state.store(.unlocked, .release);
                     self.releaseReq(ctx);
                     return error.RequestTimeout;
                 }
-                while (!ctx.mutex.tryLock()) std.Thread.yield() catch {};
             }
-            ctx.mutex.state.store(.unlocked, .release);
         }
         const resp = ctx.response;
         self.releaseReq(ctx);
@@ -286,8 +284,6 @@ const RequestContext = struct {
     body: ?[]const u8,
     response: Response,
     done: bool,
-    mutex: std.Io.Mutex,
-    cond: std.Io.Condition,
     allocator: Allocator,
     client: *HttpClient,
     pool_id: usize,
@@ -295,11 +291,12 @@ const RequestContext = struct {
     gen: u64,
     cancelled: bool,
 
+    // Notify is called from the IO thread (via InvokeQueue -> handleRequest).
+    // request() spins on the caller thread. Single-writer single-reader:
+    // @atomicStore/.acquire is sufficient; a full mutex is unnecessary.
     fn notify(self: *RequestContext) void {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
-        defer self.mutex.state.store(.unlocked, .release);
         if (@atomicLoad(bool, &self.cancelled, .acquire)) return;
-        self.done = true;
+        @atomicStore(bool, &self.done, true, .release);
     }
 
     fn cleanup(self: *RequestContext) void {
@@ -470,7 +467,16 @@ fn httpRequestFiber(user_ctx: ?*anyopaque, complete: *const fn (?*anyopaque, []c
     };
     ctx.cleanup();
 
-    var resp_buf: [65536]u8 = undefined;
+    // Allocate from ring allocator instead of the fiber stack: the fiber
+    // stack is only 64KB and a 64KB local array here + other locals + the
+    // fiber frame itself exceeds it, causing deterministic stack overflow.
+    const resp_buf = ctx.client.ring_b.allocator.alloc(u8, 65536) catch {
+        cache.evictPipe(pipe);
+        ctx.response = makeErrorResponse(ctx.allocator, 502, "OOM");
+        ctx.notify();
+        return;
+    };
+    defer ctx.client.ring_b.allocator.free(resp_buf);
     var total: usize = 0;
     var complete_len: usize = 0;
     var invalid_response = false;

@@ -14,6 +14,7 @@ const sticker = @import("../stack_pool_sticker.zig");
 const Fiber = @import("../next/fiber.zig").Fiber;
 const ws_fiber = @import("ws_fiber.zig");
 const logErr = helpers.logErr;
+const milliTimestamp = @import("event_loop.zig").milliTimestamp;
 
 pub fn tryWsUpgrade(self: *AsyncServer, conn_id: u64, conn: *Connection, path: []const u8, data: []const u8, bid: u16) void {
     const full_uri = helpers.getFullUri(data);
@@ -105,6 +106,14 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
     conn.read_bid = bid;
     conn.read_len = nread;
 
+    // Refresh TTL activity timestamp for WebSocket connections.
+    // slot.line2.last_active_ms is only set at accept time; without this,
+    // WebSocket connections time out after idle_timeout_ms despite being active.
+    if (conn.pool_idx != 0xFFFFFFFF) {
+        const now_ws = milliTimestamp(self.io);
+        self.pool.slots[conn.pool_idx].line2.last_active_ms = now_ws;
+    }
+
     const frame = ws_frame.parseFrame(read_buf[0..nread]) catch {
         self.buffer_pool.markReplenish(bid);
         conn.read_len = 0;
@@ -120,8 +129,15 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
 
     switch (frame.opcode) {
         .close => {
-            var close_buf: [32]u8 = undefined;
-            const close_len = ws_frame.writeFrame(&close_buf, .{
+            const total = ws_frame.frameSize(frame.payload.len);
+            if (!self.ensureWriteBuf(conn, total)) {
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
+                self.closeConn(conn_id, conn.fd);
+                return;
+            }
+            const wbuf = conn.response_buf.?;
+            _ = ws_frame.writeFrame(wbuf, .{
                 .opcode = .close,
                 .fin = true,
                 .payload = frame.payload,
@@ -133,23 +149,27 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
             };
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
-            if (self.ensureWriteBuf(conn, close_len)) {
-                const wbuf = conn.response_buf.?;
-                @memcpy(wbuf[0..close_len], close_buf[0..close_len]);
-                conn.write_headers_len = close_len;
-                conn.write_offset = 0;
-                conn.state = .ws_writing;
-                conn.keep_alive = false;
-                self.submitWrite(conn_id, conn) catch {
-                    self.closeConn(conn_id, conn.fd);
-                };
-            } else {
+            conn.write_headers_len = total;
+            conn.write_offset = 0;
+            conn.state = .ws_writing;
+            conn.keep_alive = false;
+            self.submitWrite(conn_id, conn) catch {
                 self.closeConn(conn_id, conn.fd);
-            }
+            };
         },
         .ping => {
-            var pong_buf: [16]u8 = undefined;
-            const pong_len = ws_frame.writeFrame(&pong_buf, .{
+            const pong_total = ws_frame.frameSize(frame.payload.len);
+            if (!self.ensureWriteBuf(conn, pong_total)) {
+                self.buffer_pool.markReplenish(bid);
+                conn.read_len = 0;
+                conn.state = .ws_reading;
+                self.submitRead(conn_id, conn) catch {
+                    self.closeConn(conn_id, conn.fd);
+                };
+                return;
+            }
+            const wbuf = conn.response_buf.?;
+            _ = ws_frame.writeFrame(wbuf, .{
                 .opcode = .pong,
                 .fin = true,
                 .payload = frame.payload,
@@ -164,21 +184,12 @@ pub fn onWsFrame(self: *AsyncServer, conn_id: u64, res: i32, user_data: u64, cqe
             };
             self.buffer_pool.markReplenish(bid);
             conn.read_len = 0;
-            if (self.ensureWriteBuf(conn, pong_len)) {
-                const wbuf = conn.response_buf.?;
-                @memcpy(wbuf[0..pong_len], pong_buf[0..pong_len]);
-                conn.write_headers_len = pong_len;
-                conn.write_offset = 0;
-                conn.state = .ws_writing;
-                self.submitWrite(conn_id, conn) catch {
-                    self.closeConn(conn_id, conn.fd);
-                };
-            } else {
-                conn.state = .ws_reading;
-                self.submitRead(conn_id, conn) catch {
-                    self.closeConn(conn_id, conn.fd);
-                };
-            }
+            conn.write_headers_len = pong_total;
+            conn.write_offset = 0;
+            conn.state = .ws_writing;
+            self.submitWrite(conn_id, conn) catch {
+                self.closeConn(conn_id, conn.fd);
+            };
         },
         .pong => {
             self.buffer_pool.markReplenish(bid);

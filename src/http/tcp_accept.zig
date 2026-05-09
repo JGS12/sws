@@ -50,8 +50,10 @@ pub fn onAcceptComplete(self: *AsyncServer, res: i32, user_data: u64) void {
     if (alloc.idx == 0xFFFFFFFF) {
         const rc = linux.close(conn_fd);
         if (rc != 0) logErr("close conn_fd={d} failed: {d}", .{ conn_fd, rc });
+        // Pool full: stall accept but do NOT resubmit here. Resubmitting
+        // immediately creates a tight accept-fail-close loop that wastes
+        // CPU. closeConn will resubmit when a slot is freed.
         self.accept_stalled = true;
-        self.submitAccept() catch |err| logErr("failed to resubmit accept (pool full): {s}", .{@errorName(err)});
         return;
     }
     const pool_idx = alloc.idx;
@@ -109,7 +111,14 @@ pub fn onAcceptComplete(self: *AsyncServer, res: i32, user_data: u64) void {
         return;
     };
     self.submitRead(conn_id, conn_ptr) catch |err| {
-        if (err == error.RingFull) {} else {
+        if (err == error.RingFull) {
+            // SQ ring is full; the connection was accepted but no read SQE
+            // could be submitted. Without a read, this connection will never
+            // receive data. Close it immediately rather than letting it idle
+            // until TTL timeout.
+            logErr("submitRead RingFull for new conn fd={d}, closing", .{conn_fd});
+            self.closeConn(conn_id, conn_fd);
+        } else {
             logErr("submitRead failed for fd {}: {s}", .{ conn_fd, @errorName(err) });
             self.closeConn(conn_id, conn_fd);
         }
